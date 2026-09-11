@@ -1,0 +1,3 @@
+# Optional local TTS engine. Kept separate because PyTorch and model weights
+# add several GB and are not required for the normal edge-tts workflow.
+voxcpm>=2.0.3,<3

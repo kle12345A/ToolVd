@@ -1,0 +1,41 @@
+# Local dependencies, downloaded tools and generated artifacts
+venv/
+.venv/
+env/
+tools/
+models/
+build/
+dist/
+output/
+data/
+logs/
+tests/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage*
+htmlcov/
+node_modules/
+# Secrets and personal/editor files
+.env
+.env.*
+*.pem
+*.key
+*cookies*.txt
+.agents/
+.codex/
+.claude/
+.vscode/
+.idea/
+SYSTEM.md
+# Local reference media and experiments
+/*.mp4
+/*.jpg
+/_tmp*/
+/test_*
+/assets/nha-minh-lam-nong-*
