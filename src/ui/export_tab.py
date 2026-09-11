@@ -590,7 +590,7 @@ class ExportTab(QWidget):
         self.cmb_remove_wm_mode = QComboBox()
         self.cmb_remove_wm_mode.addItem("Blur vung watermark", "blur")
         self.cmb_remove_wm_mode.addItem(
-            "Vá nền mềm (Delogo tự thu vùng)", "delogo"
+            "Vá nền mềm (Delogo)", "delogo"
         )
         self.cmb_remove_wm_mode.addItem("Mosaic / pixel hoa", "mosaic")
         self.cmb_remove_wm_mode.addItem("Che bang mau (xoa bang cach phu mau)", "cover")
@@ -612,8 +612,8 @@ class ExportTab(QWidget):
         wml.addRow(self.lbl_remove_wm_xy)
         wm_hint = QLabel(
             "Chọn một vùng trong danh sách rồi kéo khung Watermark bên phải. "
-            "Với Delogo, hãy ôm sát dòng chữ. Nếu lỡ chọn gần toàn chiều ngang, "
-            "tool sẽ tự thu vùng quanh tâm để tránh tạo dải sọc lớn."
+            "Delogo xử lý đúng toàn bộ vùng đã chọn, kể cả khi vùng phủ hết "
+            "chiều ngang video."
         )
         wm_hint.setStyleSheet("color:#6c7086; font-size:10px;")
         wm_hint.setWordWrap(True)

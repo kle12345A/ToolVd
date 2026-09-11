@@ -40,8 +40,17 @@ from src.utils.file_utils import ensure_dir
 from src.utils.logger import logger
 
 
-_VI_EST_WORDS_PER_SEC = 5.0
+# Vietnamese is counted by whitespace-separated syllables. Use a conservative
+# fallback until the selected provider/voice has been measured in this project.
+_VI_EST_WORDS_PER_SEC = 3.3
 _EN_EST_WORDS_PER_SEC = 2.5
+_VOICE_RATE_MIN = 1.10
+_VOICE_RATE_MAX = 1.15
+# TTS duration varies slightly between runs. Keep the selectable range capped
+# at 1.15x, but permit a tiny alignment correction instead of rejecting 1.16x.
+_VOICE_RATE_HARD_MAX = 1.17
+_DUBBING_GRACE_WORDS = 3
+_DUBBING_GRACE_SECONDS = 1.5
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -56,6 +65,49 @@ def _fmt_duration(seconds: float) -> str:
 
 def _count_words(text: str) -> int:
     return len([w for w in (text or "").split() if w.strip()])
+
+
+def _scene_budget_violations(
+    scenes: list[dict],
+    words_per_second: float,
+    max_rate: float = _VOICE_RATE_HARD_MAX,
+) -> list[dict]:
+    """Return scenes whose script cannot fit without exceeding max_rate."""
+    violations: list[dict] = []
+    pace = max(0.1, float(words_per_second))
+    rate = max(0.1, float(max_rate))
+    for scene in scenes:
+        duration = max(0.1, float(scene.get("duration", 0.0) or 0.0))
+        words = _count_words(scene.get("text", ""))
+        max_words = max(1, int(duration * pace * rate))
+        estimated_seconds = words / (pace * rate) if words else 0.0
+        if words > max_words:
+            violations.append({
+                "index": int(scene.get("index", len(violations) + 1)),
+                "words": words,
+                "max_words": max_words,
+                "remove": max(1, words - max_words),
+                "duration": duration,
+                "estimated_seconds": estimated_seconds,
+                "overflow_seconds": max(0.0, estimated_seconds - duration),
+            })
+    return violations
+
+
+def _small_dubbing_overflow_allowed(
+    overflow_seconds: float,
+    excess_words: int,
+    video_duration: float,
+) -> bool:
+    """Accept minor estimation drift while still rejecting real overflow."""
+    seconds_limit = min(
+        _DUBBING_GRACE_SECONDS,
+        max(0.75, max(0.0, float(video_duration or 0.0)) * 0.04),
+    )
+    return (
+        int(excess_words or 0) <= _DUBBING_GRACE_WORDS
+        and float(overflow_seconds or 0.0) <= seconds_limit
+    )
 
 
 class _VoiceGenWorker(QThread):
@@ -152,6 +204,11 @@ class _VoiceGenWorker(QThread):
                 self.output_path,
                 self.ffmpeg_bin,
                 progress_cb=lambda s: self.log.emit(s),
+                allow_slowdown=False,
+                max_tempo=(
+                    _VOICE_RATE_HARD_MAX
+                    / max(_VOICE_RATE_MIN, self.rate_factor)
+                ),
             )
             self.adjustments = adjustments
             self.progress.emit(100 if ok else 0)
@@ -292,7 +349,14 @@ class _DubbingWorker(QThread):
             self.log.emit(f"📝 Gom {len(original_segments)} mốc thành {len(translated)} cụm đọc liền mạch; giữ nguyên lời.")
             measurements = []
             timed_sequence: list[tuple[str, float, float, int]] = []
-            self.log.emit(f"🎚 Lồng tiếng: giữ nhịp đã chọn {max(1.10, min(1.15, self.rate_factor)):.2f}x cho toàn video.")
+            selected_max_rate = max(
+                _VOICE_RATE_MIN,
+                min(_VOICE_RATE_MAX, self.rate_factor),
+            )
+            self.log.emit(
+                f"🎚 Lồng tiếng: tự chọn nhịp chung {_VOICE_RATE_MIN:.2f}x–"
+                f"{selected_max_rate:.2f}x theo thời lượng thực tế."
+            )
             for pos, segment in enumerate(translated, start=1):
                 start = max(0.0, float(segment["start"]))
                 end = max(start + 0.1, float(segment["end"]))
@@ -319,9 +383,14 @@ class _DubbingWorker(QThread):
                         segment["text_vi"], self.voice, raw_path,
                         rate=f"+{rate_pct}%" if rate_pct >= 0 else f"{rate_pct}%",
                         volume=f"+{volume}%" if volume >= 0 else f"{volume}%",
+                        progress_cb=lambda line: self.log.emit(line),
                     )
                 if not ok:
                     raise RuntimeError(result)
+                self.log.emit(
+                    f"✅ Đã tạo audio câu {pos}/{len(translated)}; "
+                    "chưa ghép video."
+                )
                 result = trim_dubbing_edges(
                     result, str(work_dir / f"trimmed_{pos:04d}.wav"), self.ffmpeg_bin
                 )
@@ -346,12 +415,13 @@ class _DubbingWorker(QThread):
                 self.ffmpeg_bin,
                 total_duration,
                 progress_cb=lambda line: self.log.emit(line),
-                min_tempo=max(1.10, min(1.15, self.rate_factor)),
-                max_tempo=max(1.10, min(1.15, self.rate_factor)),
+                min_tempo=_VOICE_RATE_MIN,
+                max_tempo=selected_max_rate,
                 allow_overflow=True,
             )
             if not ok:
                 raise RuntimeError(result)
+            self.log.emit("✅ Đã căn xong các mốc; đang ghép audio vào video…")
             for segment, adjustment in zip(translated, adjustments):
                 voice_start = float(adjustment["placed_start"])
                 voice_duration = (
@@ -801,6 +871,19 @@ class VoiceoverTab(QWidget):
             self.cmb_provider.currentData()
             if hasattr(self, "cmb_provider") else "edge_tts"
         )
+        if self._project:
+            measurements = getattr(
+                self._project, "voice_pace_measurements", {}
+            ) or {}
+            key = f"{provider}|{voice_id}"
+            try:
+                measured = float(
+                    (measurements.get(key) or {}).get("words_per_second", 0.0)
+                )
+                if measured > 0:
+                    return measured
+            except (TypeError, ValueError, AttributeError):
+                pass
         return (
             _VI_EST_WORDS_PER_SEC
             if provider in {"nghitts", "voxcpm"}
@@ -808,13 +891,45 @@ class VoiceoverTab(QWidget):
             else _EN_EST_WORDS_PER_SEC
         )
 
+    def _save_voice_pace_measurement(self, adjustments: list[dict]) -> None:
+        """Save measured 1.0x pace for the selected provider and voice."""
+        if not self._project or not adjustments or not self._voice_worker:
+            return
+        words = sum(
+            _count_words(scene.get("text", ""))
+            for scene in self._voice_worker.scenes
+        )
+        measured_seconds = sum(
+            max(0.0, float(item.get("source_duration", 0.0) or 0.0))
+            for item in adjustments
+        )
+        rate = max(0.1, float(self._voice_worker.rate_factor))
+        base_seconds = measured_seconds * rate
+        if words <= 0 or base_seconds <= 0:
+            return
+        provider = self.cmb_provider.currentData() or "edge_tts"
+        voice = self.cmb_voice.currentData() or ""
+        key = f"{provider}|{voice}"
+        measurements = dict(
+            getattr(self._project, "voice_pace_measurements", {}) or {}
+        )
+        measurements[key] = {
+            "words_per_second": round(words / base_seconds, 4),
+            "sample_words": words,
+            "sample_seconds": round(measured_seconds, 3),
+            "rate_factor": round(rate, 3),
+        }
+        self._project.voice_pace_measurements = measurements
+        save_project(self._project)
+
     def _estimate_script_seconds(self, text: str) -> float:
         words = _count_words(text)
         rate_factor = max(0.25, self.spn_rate.value())
         return words / (self._words_per_second() * rate_factor) if words else 0.0
 
     def _max_words_for_video(self) -> int:
-        rate_factor = max(0.25, self.spn_rate.value())
+        # Capacity is always calculated at the absolute permitted ceiling.
+        rate_factor = _VOICE_RATE_HARD_MAX
         return int(
             max(0.0, self._video_duration)
             * self._words_per_second()
@@ -826,7 +941,10 @@ class VoiceoverTab(QWidget):
         if not words or self._video_duration <= 0:
             return self.spn_rate.value()
         base_seconds = words / self._words_per_second()
-        return max(0.50, min(2.00, base_seconds / self._video_duration))
+        return max(
+            _VOICE_RATE_MIN,
+            min(_VOICE_RATE_MAX, base_seconds / self._video_duration),
+        )
 
     def _dubbing_measurements(self):
         if self._project:
@@ -839,10 +957,77 @@ class VoiceoverTab(QWidget):
         return []
 
     def _validate_dubbing_budget(self, segments, duration):
-        rows = word_budget(segments, self.spn_rate.value(), self._dubbing_measurements())
-        overflow = timeline_overflow(rows, duration)
-        if overflow <= 0.005:
-            return True
+        measurements = self._dubbing_measurements()
+        # Long content is evaluated at the selected maximum rate. Short
+        # content is evaluated at 1.10x, the slowest allowed pace, because that
+        # is what the renderer now tries first to minimize silent gaps.
+        selected_max_rate = max(
+            _VOICE_RATE_MIN,
+            min(_VOICE_RATE_MAX, self.spn_rate.value()),
+        )
+        rows_fast = word_budget(segments, selected_max_rate, measurements)
+        rows_slow = word_budget(segments, _VOICE_RATE_MIN, measurements)
+        overflow = timeline_overflow(rows_fast, duration)
+        excess_words = sum(max(0, row["remove"]) for row in rows_fast)
+        # A sub-second / 2% estimate difference is normal between TTS runs.
+        # Let synthesis measure it exactly instead of rejecting useful input.
+        grace_seconds = max(0.75, float(duration or 0.0) * 0.02)
+        minor_overflow = _small_dubbing_overflow_allowed(
+            overflow,
+            excess_words,
+            duration,
+        )
+        if overflow <= grace_seconds or minor_overflow:
+            if overflow > grace_seconds:
+                self.txt_log.append(
+                    f"⚠️ Chênh lệch nhỏ: dư khoảng {overflow:.2f}s / "
+                    f"{excess_words} từ; vẫn cho phép tạo và ghép voice."
+                )
+            cursor = 0.0
+            gaps: list[tuple[float, float]] = []
+            for row in rows_slow:
+                start = max(0.0, float(row["start"]))
+                gap = max(0.0, start - cursor)
+                if gap > 0:
+                    gaps.append((start, gap))
+                cursor = max(cursor, start) + float(row["duration"])
+            tail_gap = max(0.0, float(duration or 0.0) - cursor)
+            if tail_gap > 0:
+                gaps.append((float(duration or 0.0), tail_gap))
+
+            long_gaps = [(start, gap) for start, gap in gaps if gap >= 2.0]
+            if not long_gaps:
+                return True
+
+            missing = sum(max(0, row["add"]) for row in rows_slow)
+            gap_details = "\n".join(
+                f"Trước mốc {start:.1f}s: nghỉ khoảng {gap:.2f}s"
+                for start, gap in long_gaps
+            )
+            budget_details = "\n".join(
+                f"[{row['start']:.1f}s] {row['words']} từ; nên khoảng "
+                f"{row['target']} từ (có thể thêm ~{row['add']} từ)."
+                for row in rows_slow
+                if row["add"] > 0
+            )
+            self.txt_log.append(
+                "⚠️ Phát hiện khoảng nghỉ dài trước khi tạo voice:\n"
+                + gap_details
+            )
+            answer = QMessageBox.question(
+                self,
+                "Lời thoại còn quá ngắn",
+                f"Ở nhịp chậm nhất {_VOICE_RATE_MIN:.2f}x vẫn có "
+                f"{len(long_gaps)} khoảng nghỉ từ 2 giây trở lên.\n\n"
+                f"{gap_details}\n\n"
+                f"Nên bổ sung tổng cộng khoảng {missing} từ vào đúng các mốc:\n"
+                f"{budget_details}\n\n"
+                "Bạn vẫn muốn tạo video với các khoảng nghỉ này?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+        rows = rows_fast
         details = "\n".join(
             f"[{row['start']:.1f}s] Đang có {row['words']} từ / mục tiêu ~{row['target']} từ: "
             + (f"thừa ~{row['remove']} từ → bớt ~{row['remove']} từ" if row['remove']
@@ -852,20 +1037,16 @@ class VoiceoverTab(QWidget):
         )
         self._update_story_stats()
         self.txt_log.append("Kiểm tra trước khi tạo voice:\n" + details)
-        box = QMessageBox(self)
-        box.setWindowTitle("Lời đọc dài hơn video")
-        box.setText(
+        QMessageBox.warning(
+            self,
+            "Lời đọc dài hơn video",
             f"Ở {self.spn_rate.value():.2f}x, dự tính lời vượt video {overflow:.2f}s.\n"
             f"Các câu dài: thừa ~{sum(row['remove'] for row in rows)} từ → cần bớt tương ứng.\n"
-            f"Các câu ngắn: thiếu ~{sum(row['add'] for row in rows)} từ → có thể thêm tương ứng (không bắt buộc)."
+            f"Các câu ngắn: thiếu ~{sum(row['add'] for row in rows)} từ → có thể thêm tương ứng (không bắt buộc).\n\n"
+            f"Hãy sửa lời rồi tạo lại. Tool không tạo voice khi dự tính cần "
+            f"tốc độ vượt {_VOICE_RATE_HARD_MAX:.2f}x."
         )
-        box.setInformativeText("Bạn vẫn có thể tạo và ghép. Tốc độ giữ nguyên; phần lời vượt cuối video sẽ bị cắt trong video, audio riêng vẫn đầy đủ. Đây là ước tính.")
-        box.setDetailedText(details)
-        proceed = box.addButton("Vẫn tạo và ghép", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("Quay lại sửa lời", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(proceed)
-        box.exec()
-        return box.clickedButton() == proceed
+        return False
 
     def _update_story_stats(self):
         if not hasattr(self, "lbl_story_stats"):
@@ -909,33 +1090,35 @@ class VoiceoverTab(QWidget):
             self.lbl_story_stats.setStyleSheet(base_style + " color:#89b4fa;")
             return
 
-        base = f"Tu: {words:,} | Uoc tinh doc: {_fmt_duration(est_seconds)}"
+        selected_rate = self.spn_rate.value()
+        base = (
+            f"Video: {_fmt_duration(video_seconds)} | "
+            f"Lời đọc ước tính: {_fmt_duration(est_seconds)} ở {selected_rate:.2f}x"
+        )
         if video_seconds <= 0:
-            self.lbl_story_stats.setText(base + " | Chua co thoi luong video.")
+            self.lbl_story_stats.setText(
+                f"Lời đọc ước tính: {_fmt_duration(est_seconds)} | "
+                "Chưa có thời lượng video."
+            )
             self.lbl_story_stats.setStyleSheet(base_style + " color:#89b4fa;")
             return
 
-        diff = est_seconds - video_seconds
-        max_words = self._max_words_for_video()
-        if abs(diff) <= max(2.0, video_seconds * 0.05):
-            msg = f"Video: {_fmt_duration(video_seconds)} | {base} | Khop video."
+        fastest_seconds = words / (
+            self._words_per_second() * _VOICE_RATE_HARD_MAX
+        )
+        overflow_seconds = fastest_seconds - video_seconds
+        if overflow_seconds <= 0:
+            msg = (
+                f"{base} | Có thể ghép trong giới hạn "
+                f"{_VOICE_RATE_MIN:.2f}x–{_VOICE_RATE_HARD_MAX:.2f}x."
+            )
             color = "#a6e3a1"
-        elif diff > 0:
-            needed_rate = self._recommended_rate_factor(text)
-            msg = (
-                f"Video: {_fmt_duration(video_seconds)} | {base} | "
-                f"Du {_fmt_duration(diff)}. Tốc độ gợi ý ~{needed_rate:.2f}x "
-                f"Thừa ~{max(0, words-max_words):,} từ → bớt ~{max(0, words-max_words):,} từ, còn ~{max_words:,} từ."
-            )
-            color = "#f9e2af"
         else:
-            needed_rate = self._recommended_rate_factor(text)
             msg = (
-                f"Video: {_fmt_duration(video_seconds)} | {base} | "
-                f"Ngan hon video {_fmt_duration(abs(diff))}; "
-                f"Thiếu ~{max(0, max_words-words):,} từ → có thể thêm ~{max(0, max_words-words):,} từ, đạt ~{max_words:,} từ (không bắt buộc)."
+                f"{base} | Ở tốc độ tối đa {_VOICE_RATE_HARD_MAX:.2f}x "
+                f"vẫn dư khoảng {overflow_seconds:.2f} giây."
             )
-            color = "#89b4fa"
+            color = "#f38ba8"
         self.lbl_story_stats.setText(msg)
         self.lbl_story_stats.setStyleSheet(base_style + f" color:{color};")
 
@@ -944,7 +1127,7 @@ class VoiceoverTab(QWidget):
             return
         mode = self.cmb_voice_mode.currentData() or "parts"
         is_dub = mode == "dub_timed_manual"
-        self.spn_rate.setRange(1.10 if is_dub else 0.50, 1.15 if is_dub else 2.00)
+        self.spn_rate.setRange(_VOICE_RATE_MIN, _VOICE_RATE_MAX)
         form = self.cmb_dub_ai.parentWidget().layout()
         if isinstance(form, QFormLayout):
             form.setRowVisible(self.cmb_dub_ai, False)
@@ -953,6 +1136,10 @@ class VoiceoverTab(QWidget):
         self.btn_scan_chinese.setVisible(is_dub)
         self.btn_auto_dub.setVisible(is_dub)
         self.btn_gen_voice.setVisible(not is_dub)
+        # Timed dubbing already creates voice and merges the working video in
+        # one operation. Hiding the regular merge button avoids presenting a
+        # second, disabled button that looks like a blocked required step.
+        self.btn_merge.setVisible(not is_dub)
         self.txt_script.setReadOnly(False)
         if is_dub:
             self.txt_script.setPlaceholderText(
@@ -1269,6 +1456,35 @@ class VoiceoverTab(QWidget):
         estimated_seconds = self._estimate_script_seconds(spoken_text)
         video_seconds = max(0.0, self._video_duration)
 
+        violations = _scene_budget_violations(
+            scenes,
+            self._words_per_second(),
+            _VOICE_RATE_HARD_MAX,
+        )
+        if violations:
+            details = "\n".join(
+                f"Cảnh {item['index']}: dự tính {item['estimated_seconds']:.2f}s / "
+                f"video {item['duration']:.2f}s — dư khoảng "
+                f"{item['overflow_seconds']:.2f}s."
+                for item in violations
+            )
+            total_overflow = sum(item["overflow_seconds"] for item in violations)
+            self.txt_log.append(
+                "❌ Dừng trước khi tạo voice: kịch bản không thể khớp video "
+                f"trong giới hạn tối đa {_VOICE_RATE_HARD_MAX:.2f}x.\n"
+                + details
+            )
+            QMessageBox.warning(
+                self,
+                "Kịch bản quá dài",
+                f"Chưa tạo voice vì cần tốc độ vượt {_VOICE_RATE_HARD_MAX:.2f}x.\n\n"
+                f"Lời đọc dự tính dư tổng cộng khoảng {total_overflow:.2f} giây. "
+                "Hãy rút ngắn nội dung tương ứng rồi thử lại.\n\n"
+                f"{details}",
+            )
+            self._update_story_stats()
+            return
+
         voice = self.cmb_voice.currentData() or "vi-VN-HoaiMyNeural"
         rate_factor = self.spn_rate.value()
         vol_val = self.spn_vol.value()
@@ -1421,6 +1637,10 @@ class VoiceoverTab(QWidget):
         # Hide after 3 seconds
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(3000, lambda: self.progress_bar.setVisible(False))
+        adjustments = getattr(self._voice_worker, "adjustments", [])
+        if adjustments:
+            self._save_voice_pace_measurement(adjustments)
+            self._update_story_stats()
         if ok:
             self._generated_audio = result
             self.btn_preview_voice.setEnabled(True)
@@ -1444,7 +1664,6 @@ class VoiceoverTab(QWidget):
                             f"⏱ Voice đã căn: {voice_dur:.2f}s | "
                             f"Video review: {video_dur:.2f}s"
                         )
-                adjustments = getattr(self._voice_worker, "adjustments", [])
                 if adjustments:
                     raw_total = sum(item["source_duration"] for item in adjustments)
                     target_total = sum(item["target_duration"] for item in adjustments)
@@ -1468,27 +1687,29 @@ class VoiceoverTab(QWidget):
                     )
                     unsafe = [
                         rate for rate in scene_rates
-                        if rate < 0.75 or rate > 1.50
+                        if rate < _VOICE_RATE_MIN - 0.001
+                        or rate > _VOICE_RATE_HARD_MAX + 0.001
                     ]
-                    unnatural = [
+                    within_grace = [
                         rate for rate in scene_rates
-                        if rate < 0.85 or rate > 1.25
+                        if _VOICE_RATE_MAX + 0.001 < rate
+                        <= _VOICE_RATE_HARD_MAX + 0.001
                     ]
                     if unsafe:
                         self.btn_merge.setEnabled(False)
                         self.txt_log.append(
-                            "❌ Có cảnh cần tốc độ ngoài 0.75x–1.50x. "
-                            "Hãy rút/viết thêm kịch bản cho cảnh đó rồi tạo lại; "
-                            "app đã khóa Ghép để tránh giọng méo hoặc khó nghe."
-                        )
-                    elif unnatural:
-                        self._project.voice_alignment_ok = True
-                        self.txt_log.append(
-                            "⚠️ Một số cảnh nằm ngoài vùng tự nhiên 0.85x–1.25x. "
-                            "Video vẫn có thể ghép, nhưng nên chỉnh độ dài câu."
+                            f"❌ Có cảnh cần tốc độ ngoài {_VOICE_RATE_MIN:.2f}x–"
+                            f"{_VOICE_RATE_HARD_MAX:.2f}x. Hãy chỉnh độ dài kịch bản "
+                            "rồi tạo lại; app không tăng tốc quá giới hạn."
                         )
                     else:
                         self._project.voice_alignment_ok = True
+                        if within_grace:
+                            self.txt_log.append(
+                                f"⚠️ Sai số căn nhỏ: tốc độ thực tế vượt "
+                                f"{_VOICE_RATE_MAX:.2f}x nhưng không quá "
+                                f"{_VOICE_RATE_HARD_MAX:.2f}x; vẫn cho phép ghép."
+                            )
                 if not self._project.voice_alignment_ok:
                     self.btn_merge.setEnabled(False)
                 save_project(self._project)
@@ -1712,10 +1933,29 @@ class VoiceoverTab(QWidget):
             self._update_story_stats()
             details = getattr(self, "_dubbing_budget_details", "")
             self.txt_log.append(details)
+            error_text = str(result)
+            is_tts_service_error = any(
+                marker in error_text.lower()
+                for marker in (
+                    "no audio was received",
+                    "không trả về audio",
+                    "connect",
+                    "timeout",
+                    "websocket",
+                )
+            )
             box = QMessageBox(self)
-            box.setWindowTitle("Cần sửa lời lồng tiếng")
-            box.setText(str(result))
-            box.setInformativeText("Gợi ý số từ đã cập nhật dưới ô lời thoại. Bấm Show Details để xem từng mốc.")
+            box.setWindowTitle(
+                "Edge TTS tạm thời không trả audio"
+                if is_tts_service_error else "Không thể hoàn tất ghép giọng"
+            )
+            box.setText(error_text)
+            box.setInformativeText(
+                "Video chưa được ghép xong nên tool chưa chuyển sang tab Phụ đề. "
+                "Hãy bấm Tạo voice & ghép theo các mốc để thử lại."
+                if is_tts_service_error else
+                "Video chưa được ghép xong. Bấm Show Details để xem từng mốc."
+            )
             box.setDetailedText(details)
             box.exec()
             return

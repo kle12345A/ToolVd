@@ -366,7 +366,10 @@ def generate_edge_tts(
 
         def _generate_with_retry(chunk_text: str, out_file: str, label: str):
             last_error = None
-            retry_delays = (15, 35)
+            # Edge's public endpoint occasionally returns an empty stream even
+            # though the same request succeeds immediately afterwards.  Keep
+            # retries short so the UI does not look as if it has frozen.
+            retry_delays = (2, 5)
             for attempt in range(1, 4):
                 try:
                     Path(out_file).unlink(missing_ok=True)
@@ -896,6 +899,7 @@ def align_voice_segments(
     ffmpeg_bin: str,
     progress_cb: Optional[Callable[[str], None]] = None,
     allow_slowdown: bool = True,
+    max_tempo: float | None = None,
 ) -> tuple[bool, str, list[dict]]:
     """Fit each narration file to its scene and join them in timeline order."""
     if not segment_paths:
@@ -919,6 +923,30 @@ def align_voice_segments(
         # pace. A short sentence ends naturally and the remaining slot stays
         # silent; only an overlong sentence is accelerated to meet the next cue.
         tempo = requested_tempo if allow_slowdown else max(1.0, requested_tempo)
+        adjustments.append({
+            "part_index": int(part_index),
+            "source_duration": actual,
+            "target_duration": target,
+            "tempo_factor": tempo,
+        })
+        if max_tempo is not None and tempo > float(max_tempo) + 0.001:
+            fitted_seconds = actual / float(max_tempo)
+            overflow_seconds = max(0.0, fitted_seconds - target)
+            if progress_cb:
+                progress_cb(
+                    f"❌ Part {part_index}: voice {actual:.2f}s vượt khung "
+                    f"{target:.2f}s; cần hệ số căn {tempo:.2f}x nhưng chỉ còn "
+                    f"cho phép tối đa {float(max_tempo):.2f}x. Sau khi căn vẫn "
+                    f"dư {overflow_seconds:.2f}s."
+                )
+            return (
+                False,
+                f"Voice Part {part_index}: ở tốc độ tối đa vẫn dài "
+                f"{fitted_seconds:.2f}s / video {target:.2f}s, dư "
+                f"{overflow_seconds:.2f}s. Hãy rút ngắn nội dung tương ứng; "
+                "ứng dụng không tăng quá giới hạn hoặc cắt mất câu cuối.",
+                adjustments,
+            )
         inputs.extend(["-i", audio_path])
         label = f"a{pos}"
         labels.append(f"[{label}]")
@@ -927,12 +955,6 @@ def align_voice_segments(
             f"apad=whole_dur={target:.6f},atrim=duration={target:.6f},"
             f"asetpts=N/SR/TB[{label}]"
         )
-        adjustments.append({
-            "part_index": int(part_index),
-            "source_duration": actual,
-            "target_duration": target,
-            "tempo_factor": tempo,
-        })
         if progress_cb:
             if not allow_slowdown and requested_tempo < 1.0:
                 progress_cb(

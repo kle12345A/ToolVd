@@ -849,30 +849,19 @@ def _refine_delogo_region(
     rh: float,
     strength: int,
 ) -> tuple[float, float, float, float]:
-    """Keep an accidentally full-width subtitle selection from smearing a frame.
+    """Return the exact normalized region selected by the user.
 
-    ``delogo`` interpolates from the rectangle edges.  A rectangle spanning the
-    whole frame therefore turns every column into a long vertical streak.  For
-    these oversized subtitle bands, retain their centre but use a tighter repair
-    area.  Normal, deliberately fitted selections are left untouched.
+    Older builds silently reduced selections wider than 85%, which made it
+    impossible to remove subtitles spanning the whole frame. FFmpeg already
+    receives a one-pixel safety margin below, so no extra shrinking is needed.
     """
-    if rw <= 0.85:
-        return rx, ry, rw, rh
-
-    strength = max(1, min(5, int(strength)))
-    max_width = {1: 0.76, 2: 0.70, 3: 0.64, 4: 0.60, 5: 0.56}[strength]
-    max_height = {1: 0.080, 2: 0.075, 3: 0.070, 4: 0.065, 5: 0.060}[strength]
-    left = (1.0 - rw) * rx
-    top = (1.0 - rh) * ry
-    center_x = left + rw / 2.0
-    center_y = top + rh / 2.0
-    new_w = min(rw, max_width)
-    new_h = min(rh, max_height)
-    new_left = max(0.0, min(1.0 - new_w, center_x - new_w / 2.0))
-    new_top = max(0.0, min(1.0 - new_h, center_y - new_h / 2.0))
-    new_rx = new_left / max(1e-9, 1.0 - new_w)
-    new_ry = new_top / max(1e-9, 1.0 - new_h)
-    return new_rx, new_ry, new_w, new_h
+    del strength  # Kept in the signature for compatibility with callers.
+    return (
+        max(0.0, min(1.0, float(rx))),
+        max(0.0, min(1.0, float(ry))),
+        max(0.05, min(1.0, float(rw))),
+        max(0.05, min(1.0, float(rh))),
+    )
 
 
 def _watermark_filter_segments(

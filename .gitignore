@@ -3,7 +3,7 @@ venv/
 .venv/
 env/
 tools/
-models/
+/models/
 build/
 dist/
 output/

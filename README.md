@@ -135,9 +135,9 @@ Nhờ vậy phụ đề bám đúng câu review đang phát. Nếu thay giọng 
 - Chọn cách hiển thị phụ đề rồi xuất **một video review hoàn chỉnh**.
 - Mỗi lần xuất đều dựng lại từ các artifact sạch của project, không nối tiếp từ file Part đã có chữ.
 - Để che phụ đề nước ngoài đã dính vào hình, bật **Xử lý watermark**, chọn
-  **Vá nền mềm (Delogo tự thu vùng)**, rồi kéo vùng chọn ôm sát dòng chữ cũ.
-  Nếu vùng chọn vô tình phủ gần hết chiều ngang, tool tự thu vùng quanh tâm để
-  tránh dải sọc lớn. Phụ đề tiếng Việt được vẽ sau bước vá nền nên luôn nằm phía trên.
+  **Vá nền mềm (Delogo)**, rồi kéo vùng chọn ôm sát dòng chữ cũ. Vùng chọn có thể
+  phủ hết chiều ngang video khi phụ đề cũ chạy dài toàn khung. Phụ đề tiếng Việt
+  được vẽ sau bước vá nền nên luôn nằm phía trên.
 
 Luồng review tiêu chuẩn kết thúc ở một file xuất cuối và không cần chạy thêm công cụ Ghép video.
 

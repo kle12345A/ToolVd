@@ -1,6 +1,7 @@
 """Phiên âm nguồn hoặc narration bằng faster-whisper."""
 
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -574,17 +575,28 @@ class TranscribeTab(QWidget):
         self.txt_log.setMaximumHeight(140)
         right_layout.addWidget(self.txt_log)
 
-        # Transcript preview
-        right_layout.addWidget(QLabel("Nội dung phiên âm (chỉ xem):"))
+        # Editable transcript. Timestamps identify segments and stay unchanged;
+        # users can correct the recognized text before downstream processing.
+        right_layout.addWidget(QLabel("Nội dung phiên âm (có thể chỉnh sửa):"))
         self.txt_transcript = QTextEdit()
-        self.txt_transcript.setReadOnly(True)
+        self.txt_transcript.setReadOnly(False)
         self.txt_transcript.setPlaceholderText(
-            "Transcript sẽ hiển thị ở đây sau khi phiên âm xong..."
+            "Transcript sẽ hiển thị ở đây sau khi phiên âm xong. "
+            "Hãy giữ nguyên các mốc [x.xs] và sửa phần nội dung phía sau."
         )
         self.txt_transcript.setStyleSheet(
             "background: #181825; color: #cdd6f4; font-size: 12px;"
         )
+        self.txt_transcript.textChanged.connect(self._on_transcript_edited)
         right_layout.addWidget(self.txt_transcript, 1)
+
+        self.btn_save_transcript = QPushButton("💾 Lưu nội dung chỉnh sửa")
+        self.btn_save_transcript.setEnabled(False)
+        self.btn_save_transcript.setToolTip(
+            "Lưu phần chữ đã sửa vào transcript JSON; các mốc thời gian được giữ nguyên."
+        )
+        self.btn_save_transcript.clicked.connect(self._save_transcript_edits)
+        right_layout.addWidget(self.btn_save_transcript)
 
         splitter.addWidget(right)
         splitter.setSizes([340, 660])
@@ -994,7 +1006,109 @@ class TranscribeTab(QWidget):
         lines = []
         for seg in transcript.get("segments", []):
             lines.append(f"[{seg['start']:.1f}s] {seg['text']}")
+        self.txt_transcript.blockSignals(True)
         self.txt_transcript.setPlainText("\n".join(lines))
+        self.txt_transcript.blockSignals(False)
+        self.btn_save_transcript.setEnabled(False)
+
+    def _on_transcript_edited(self):
+        self.btn_save_transcript.setEnabled(bool(self._transcript))
+
+    def _save_transcript_edits(self):
+        self._apply_transcript_edits(show_confirmation=True)
+
+    def _apply_transcript_edits(self, show_confirmation: bool = False) -> bool:
+        """Validate the editor and persist corrected segment text.
+
+        The displayed timestamp is an identifier, not an editable timing tool.
+        Keeping the segment count and timestamps stable protects subtitle sync.
+        """
+        if not self._transcript or not self._project:
+            return False
+
+        segments = self._transcript.get("segments", [])
+        lines = [
+            line.strip()
+            for line in self.txt_transcript.toPlainText().splitlines()
+            if line.strip()
+        ]
+        if len(lines) != len(segments):
+            QMessageBox.warning(
+                self,
+                "Không thể lưu transcript",
+                "Số dòng đã thay đổi. Vui lòng giữ mỗi đoạn trên một dòng và "
+                "không xóa các mốc [x.xs].",
+            )
+            return False
+
+        parsed_texts: list[str] = []
+        for index, (line, segment) in enumerate(zip(lines, segments), start=1):
+            match = re.match(r"^\[(\d+(?:\.\d+)?)s\]\s*(.*)$", line)
+            if not match:
+                QMessageBox.warning(
+                    self,
+                    "Không thể lưu transcript",
+                    f"Dòng {index} không đúng định dạng [x.xs] nội dung.",
+                )
+                return False
+            shown_start = float(match.group(1))
+            actual_start = float(segment.get("start", 0.0))
+            if abs(shown_start - actual_start) > 0.11:
+                QMessageBox.warning(
+                    self,
+                    "Không thể lưu transcript",
+                    f"Mốc thời gian ở dòng {index} đã bị thay đổi. "
+                    f"Hãy giữ nguyên [{actual_start:.1f}s].",
+                )
+                return False
+            corrected = match.group(2).strip()
+            if not corrected:
+                QMessageBox.warning(
+                    self,
+                    "Không thể lưu transcript",
+                    f"Nội dung dòng {index} đang để trống.",
+                )
+                return False
+            parsed_texts.append(corrected)
+
+        changed = 0
+        for segment, corrected in zip(segments, parsed_texts):
+            old_text = (segment.get("text") or "").strip()
+            if corrected != old_text:
+                segment["text"] = corrected
+                # Existing word timings contain the old recognition. Subtitle
+                # builders will estimate fresh word timings from corrected text.
+                segment.pop("words", None)
+                changed += 1
+
+        self._transcript["text"] = " ".join(parsed_texts)
+        transcript_path = self._persist_transcript(self._transcript)
+
+        if self.mode == "narration" and changed:
+            # The current subtitle was generated from stale text. Keep its file
+            # on disk, but require regeneration before final export.
+            self._project.narration_subtitle_file = ""
+            self._project.export_config.global_subtitle_file = ""
+            self._project.export_config.subtitle_enabled = False
+            self.lbl_sub_status.setText("⚠️ Nội dung đã sửa — hãy tạo lại subtitle.")
+            save_project(self._project)
+
+        self.btn_save_transcript.setEnabled(False)
+        self.txt_log.append(
+            f"💾 Đã lưu {changed} đoạn chỉnh sửa: {transcript_path}"
+        )
+        self.transcript_ready.emit(self._transcript)
+        if self.mode == "narration":
+            self.narration_transcript_ready.emit(self._transcript)
+        else:
+            self.source_transcript_ready.emit(self._transcript)
+        if show_confirmation:
+            QMessageBox.information(
+                self,
+                "Đã lưu transcript",
+                f"Đã cập nhật {changed} đoạn phiên âm.",
+            )
+        return True
 
     def _load_existing(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1031,6 +1145,10 @@ class TranscribeTab(QWidget):
                 "Subtitle cuối chỉ được tạo ở chế độ phiên âm narration.",
             )
             return
+
+        if self.btn_save_transcript.isEnabled():
+            if not self._apply_transcript_edits(show_confirmation=False):
+                return
 
         style = self.cmb_sub_style.currentData()
         self.btn_gen_subs.setEnabled(False)
